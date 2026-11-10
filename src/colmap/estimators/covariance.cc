@@ -5,10 +5,18 @@
 #include "colmap/estimators/cost_functions/manifold.h"
 #include "colmap/util/hash_containers.h"
 
+#include <algorithm>
+#include <random>
+
 #include <ceres/crs_matrix.h>
 
 namespace colmap {
 namespace {
+
+// Point Jacobian singular values below this fraction of the largest singular
+// value are truncated during Schur elimination so ill-conditioned or
+// rank-deficient points preserve the gauge invariance of the Schur complement.
+constexpr double kMinPointSingularValueRatio = 1e-7;
 
 bool ComputeSchurComplement(bool estimate_point_covs,
                             bool estimate_pose_covs,
@@ -54,7 +62,9 @@ bool ComputeSchurComplement(bool estimate_point_covs,
       J_full_crs.values.data());
 
   if (points.empty()) {
-    S = J_full.transpose() * J_full;
+    if (estimate_pose_covs || estimate_other_covs) {
+      S = J_full.transpose() * J_full;
+    }
     return true;
   }
 
@@ -66,43 +76,109 @@ bool ComputeSchurComplement(bool estimate_point_covs,
           << ")";
 
   // Notice that here "a" refers to pose/other and "p" to point parameters.
-  const Eigen::SparseMatrix<double> J_a =
-      J_full.block(0, 0, J_full.rows(), J_full.cols() - point_num_params);
-  const Eigen::SparseMatrix<double> J_p = J_full.block(
-      0, J_full.cols() - point_num_params, J_full.rows(), point_num_params);
-  const Eigen::SparseMatrix<double> H_aa = J_a.transpose() * J_a;
-  const Eigen::SparseMatrix<double> H_ap = J_a.transpose() * J_p;
-  const Eigen::SparseMatrix<double> H_pa = H_ap.transpose();
-  Eigen::SparseMatrix<double> H_pp = J_p.transpose() * J_p;
-  // In-place computation of H_pp_inv.
-  Eigen::SparseMatrix<double>& H_pp_inv = H_pp;
+  const int a_num_params = J_full.cols() - point_num_params;
+  const bool compute_schur =
+      (estimate_pose_covs || estimate_other_covs) && a_num_params > 0;
+  if (!compute_schur && !estimate_point_covs) {
+    S.resize(0, 0);
+    return true;
+  }
+  const Eigen::SparseMatrix<double> J_p =
+      J_full.block(0, a_num_params, J_full.rows(), point_num_params);
+  // Orthogonal left singular vectors U_p of each point's Jacobian block,
+  // preserving the sparsity pattern of J_p. Forming S = J_a^T J_a - W^T W with
+  // W = U_p^T J_a avoids squaring cond(J_p) via normal equations and keeps
+  // ill-conditioned or rank-deficient points gauge invariant without damping.
+  Eigen::SparseMatrix<double> U_p;
+  if (compute_schur) {
+    U_p.resize(J_full.rows(), point_num_params);
+    U_p.reserve(J_p.nonZeros());
+  }
+
+  std::vector<int> rows;
   int point_param_idx = 0;
   for (const internal::PointParam& point : points) {
     const int tangent_size = ParameterBlockTangentSize(problem, point.xyz);
-    const Eigen::MatrixXd H_pp_idx =
-        H_pp.block(
-            point_param_idx, point_param_idx, tangent_size, tangent_size) +
-        damping * Eigen::MatrixXd::Identity(tangent_size, tangent_size);
-    const Eigen::MatrixXd H_pp_idx_inv = H_pp_idx.inverse();
-    for (int i = 0; i < tangent_size; ++i) {
-      for (int j = 0; j < tangent_size; ++j) {
-        H_pp_inv.coeffRef(point_param_idx + i, point_param_idx + j) =
-            H_pp_idx_inv(i, j);
+    rows.clear();
+    for (int c = 0; c < tangent_size; ++c) {
+      for (Eigen::SparseMatrix<double>::InnerIterator it(J_p,
+                                                         point_param_idx + c);
+           it;
+           ++it) {
+        rows.push_back(it.row());
       }
     }
+    std::sort(rows.begin(), rows.end());
+    rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+
+    if (rows.empty()) {
+      if (estimate_point_covs) {
+        point_covs.emplace(point.point3D_id,
+                           (1.0 / damping) * Eigen::MatrixXd::Identity(
+                                                 tangent_size, tangent_size));
+      }
+      point_param_idx += tangent_size;
+      continue;
+    }
+
+    Eigen::MatrixXd J_pi = Eigen::MatrixXd::Zero(rows.size(), tangent_size);
+    for (int c = 0; c < tangent_size; ++c) {
+      size_t row_pos = 0;
+      for (Eigen::SparseMatrix<double>::InnerIterator it(J_p,
+                                                         point_param_idx + c);
+           it;
+           ++it) {
+        while (rows[row_pos] < it.row()) {
+          ++row_pos;
+        }
+        J_pi(row_pos, c) = it.value();
+      }
+    }
+
+    const unsigned int svd_options =
+        (compute_schur ? Eigen::ComputeThinU : 0) |
+        (estimate_point_covs ? Eigen::ComputeFullV : 0);
+    const Eigen::JacobiSVD<Eigen::MatrixXd> svd(J_pi, svd_options);
+    const Eigen::VectorXd& singular_values = svd.singularValues();
+
+    if (compute_schur && singular_values(0) > 0) {
+      const Eigen::MatrixXd& U = svd.matrixU();
+      const double min_singular_value =
+          kMinPointSingularValueRatio * singular_values(0);
+      for (int r = 0; r < singular_values.size(); ++r) {
+        if (singular_values(r) <= min_singular_value) {
+          break;
+        }
+        for (size_t j = 0; j < rows.size(); ++j) {
+          U_p.insert(rows[j], point_param_idx + r) = U(j, r);
+        }
+      }
+    }
+
     if (estimate_point_covs) {
       // Point covariance conditioned on fixed pose/other parameters.
-      point_covs.emplace(point.point3D_id, H_pp_idx_inv);
+      const Eigen::MatrixXd& V = svd.matrixV();
+      Eigen::VectorXd inv_eigs(tangent_size);
+      for (int r = 0; r < tangent_size; ++r) {
+        const double s = r < singular_values.size() ? singular_values(r) : 0.0;
+        inv_eigs(r) = 1.0 / (s * s + damping);
+      }
+      point_covs.emplace(point.point3D_id,
+                         V * inv_eigs.asDiagonal() * V.transpose());
     }
-    point_param_idx += 3;
+    point_param_idx += tangent_size;
   }
 
-  if (!estimate_pose_covs && !estimate_other_covs) {
+  if (!compute_schur) {
+    S.resize(0, 0);
     return true;
   }
 
-  H_pp_inv.makeCompressed();
-  S = H_aa - H_ap * H_pp_inv * H_pa;
+  U_p.makeCompressed();
+  const Eigen::SparseMatrix<double> J_a =
+      J_full.block(0, 0, J_full.rows(), a_num_params);
+  const Eigen::SparseMatrix<double> W = U_p.transpose() * J_a;
+  S = J_a.transpose() * J_a - W.transpose() * W;
 
   return true;
 }
@@ -111,6 +187,9 @@ bool SchurEliminateOtherParams(double damping,
                                int pose_num_params,
                                int other_num_params,
                                Eigen::SparseMatrix<double>& S) {
+  if (other_num_params == 0) {
+    return true;
+  }
   VLOG(2) << "Schur elimination of other parameters (n = " << other_num_params
           << ")";
 
@@ -142,38 +221,214 @@ bool SchurEliminateOtherParams(double damping,
   return true;
 }
 
-bool ComputeLInverse(Eigen::SparseMatrix<double>& S, Eigen::MatrixXd& L_inv) {
-  VLOG(2) << "Start sparse Cholesky decomposition (n = " << S.rows() << ")";
-  Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> ldlt_S(S);
-  if (ldlt_S.info() != Eigen::Success) {
-    LOG(WARNING) << "Simplicial LDLT for computing L_inv failed";
-    return false;
-  }
+// Eigenvalues of the Jacobi-scaled Schur complement (unit diagonal) below this
+// threshold are considered zero. Gauge eigenvalues are at round-off level,
+// since the points are eliminated without damping.
+constexpr double kMaxNullEigenvalue = 1e-12;
+// Minimum spectral gap above kMaxNullEigenvalue required for the smallest
+// non-null eigenvalue when a gauge null space is present.
+constexpr double kMinNullSpectralGap = 1e2;
+// Regularization of the Jacobi-scaled Schur complement for the inverse
+// iteration and the pseudo-inverse, above the round-off of its null space and
+// well below the null space threshold. It biases the covariance by a relative
+// O(kScaledRegularization / eigenvalue).
+constexpr double kScaledRegularization = 1e-13;
+// A similarity transform does not change the other parameters (intrinsics), so
+// gauge null vectors of the Jacobi-scaled Schur complement (unit norm) must
+// have components below this threshold on them.
+constexpr double kMaxGaugeOtherParamsNorm = 1e-6;
+// Maximum estimated relative error from mapping the scaled gauge null space
+// back to unscaled coordinates and projecting out the W = I minimum-trace
+// gauge (Davis-Kahan bound: (||S_s * N_s|| / gap) * diag_ratio^2).
+constexpr double kMaxGaugeProjectionError = 1e-3;
+// A bundle adjustment problem without any constraints on the gauge has a
+// 7-DoF gauge freedom (Sim3).
+constexpr int kMaxGaugeDim = 7;
 
+// Returns L_inv such that L_inv^T * L_inv = S^-1, given S = P^T L D L^T P.
+Eigen::MatrixXd LInverseFromLDLT(
+    const Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>>& ldlt_S) {
   const Eigen::VectorXd D_dense = ldlt_S.vectorD();
-
-  const int rank = (D_dense.array().abs() > 1e-6).count();
-  if (rank < S.rows()) {
-    LOG(WARNING) << StringPrintf(
-        "Unable to compute covariance. The Schur complement on pose/other "
-        "parameters is rank deficient. Number of columns: %d, rank: %d. This "
-        "is likely due to the pose/other parameters being underconstrained "
-        "with Gauge ambiguity or other degeneracies.",
-        S.rows(),
-        rank);
-    return false;
-  }
-  VLOG(2) << "Finish sparse Cholesky decomposition.";
-
   const Eigen::SparseMatrix<double> L_sparse = ldlt_S.matrixL();
-  L_inv = Eigen::MatrixXd::Identity(L_sparse.rows(), L_sparse.cols());
+  Eigen::MatrixXd L_inv =
+      Eigen::MatrixXd::Identity(L_sparse.rows(), L_sparse.cols());
   L_sparse.triangularView<Eigen::Lower>().solveInPlace(L_inv);
-  for (int i = 0; i < S.rows(); ++i) {
+  for (int i = 0; i < L_inv.rows(); ++i) {
     L_inv.row(i) *= 1.0 / std::max(std::sqrt(std::max(D_dense(i), 0.)),
                                    std::numeric_limits<double>::min());
   }
   L_inv *= ldlt_S.permutationP();
+  return L_inv;
+}
+
+// Computes L_inv such that L_inv^T * L_inv = S^-1 for a positive definite S.
+bool ComputeLInverseFullRank(const Eigen::SparseMatrix<double>& S,
+                             Eigen::MatrixXd& L_inv) {
+  VLOG(2) << "Start sparse Cholesky decomposition (n = " << S.rows() << ")";
+  Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> ldlt_S(S);
+  if (ldlt_S.info() != Eigen::Success ||
+      !(ldlt_S.vectorD().array() > 0).all()) {
+    LOG(WARNING) << "Simplicial LDLT for computing L_inv failed";
+    return false;
+  }
+  VLOG(2) << "Finish sparse Cholesky decomposition.";
+  L_inv = LInverseFromLDLT(ldlt_S);
   VLOG(2) << "Finish factorization.";
+  return true;
+}
+
+// Computes L_inv such that L_inv^T * L_inv is the inverse of S or, if the
+// problem leaves the gauge free, its pseudo-inverse, i.e., the covariance in
+// the minimum-trace gauge (Förstner & Wrobel 2016, Eq. 4.224 with W = I).
+// The null space is detected on the Jacobi-scaled S_s = D^-1/2 S D^-1/2,
+// which is independent of the parameter units and the scene scale.
+bool ComputeLInverse(const Eigen::SparseMatrix<double>& S,
+                     int pose_num_params,
+                     Eigen::MatrixXd& L_inv) {
+  const int n = S.rows();
+  if (n == 0) {
+    L_inv.resize(0, 0);
+    return true;
+  }
+  const Eigen::VectorXd S_diag = S.diagonal();
+  if ((S_diag.array() <= 0).any()) {
+    LOG(WARNING) << "Unable to compute covariance. Some pose/other parameters "
+                    "are not constrained by any residual.";
+    return false;
+  }
+  const Eigen::VectorXd D_inv_sqrt = S_diag.cwiseSqrt().cwiseInverse();
+  const Eigen::SparseMatrix<double> S_s =
+      D_inv_sqrt.asDiagonal() * S * D_inv_sqrt.asDiagonal();
+  // Escalate regularization once if negative round-off within
+  // [-kMaxNullEigenvalue, -kScaledRegularization] makes S_s + eps*I indefinite.
+  Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> ldlt_S_s_damped;
+  double regularization = 0.0;
+  for (const double reg : {kScaledRegularization, 2.0 * kMaxNullEigenvalue}) {
+    Eigen::SparseMatrix<double> S_s_damped = S_s;
+    for (int i = 0; i < n; ++i) {
+      S_s_damped.coeffRef(i, i) += reg;
+    }
+    ldlt_S_s_damped.compute(S_s_damped);
+    if (ldlt_S_s_damped.info() == Eigen::Success &&
+        (ldlt_S_s_damped.vectorD().array() > 0).all()) {
+      regularization = reg;
+      break;
+    }
+  }
+  if (regularization == 0.0) {
+    LOG(WARNING) << "Simplicial LDLT of the damped Schur complement failed";
+    return false;
+  }
+
+  // Block inverse iteration for the smallest eigenvalues of S_s, with one more
+  // vector than the gauge freedom to detect larger null spaces, followed by
+  // Rayleigh-Ritz.
+  const int block_size = std::min(kMaxGaugeDim + 1, n);
+  std::mt19937 prng(0);
+  std::normal_distribution<double> normal;
+  Eigen::MatrixXd X = Eigen::MatrixXd::NullaryExpr(
+      n, block_size, [&]() { return normal(prng); });
+  for (int i = 0; i < 3; ++i) {
+    X = Eigen::HouseholderQR<Eigen::MatrixXd>(ldlt_S_s_damped.solve(X))
+            .householderQ() *
+        Eigen::MatrixXd::Identity(n, block_size);
+  }
+  const Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> ritz(X.transpose() *
+                                                            (S_s * X));
+  VLOG(2) << "Smallest eigenvalues of the scaled Schur complement: "
+          << ritz.eigenvalues().transpose();
+  if (ritz.eigenvalues()(0) < -kMaxNullEigenvalue) {
+    LOG(WARNING) << StringPrintf(
+        "Unable to compute covariance. The Schur complement on pose/other "
+        "parameters has a negative eigenvalue (%e) beyond numerical round-off.",
+        ritz.eigenvalues()(0));
+    return false;
+  }
+  const int num_null =
+      (ritz.eigenvalues().array() <= kMaxNullEigenvalue).count();
+  if (num_null == 0) {
+    return ComputeLInverseFullRank(S, L_inv);
+  }
+  if (num_null > kMaxGaugeDim || num_null == n) {
+    LOG(WARNING) << StringPrintf(
+        "Unable to compute covariance. The Schur complement on pose/other "
+        "parameters has a null space of dimension %d or more, which exceeds "
+        "the gauge freedom. This is likely due to the pose/other parameters "
+        "being underconstrained or other degeneracies.",
+        num_null);
+    return false;
+  }
+  if (ritz.eigenvalues()(num_null) <
+      kMinNullSpectralGap * std::max(kMaxNullEigenvalue, regularization)) {
+    LOG(WARNING) << StringPrintf(
+        "Unable to compute covariance. The Schur complement on pose/other "
+        "parameters has an ambiguous near-zero eigenvalue (%e) that is not "
+        "clearly separated from the gauge null space.",
+        ritz.eigenvalues()(num_null));
+    return false;
+  }
+
+  // Eigenvalues are sorted in increasing order. Only the null-space dimension
+  // (<= kMaxGaugeDim) and absence of other-parameter support are checked so
+  // ComputeLInverse stays independent of pose parameterizations (pose-only
+  // degeneracies of dimension <= 7 are therefore treated as gauge freedoms).
+  const Eigen::MatrixXd N_s = X * ritz.eigenvectors().leftCols(num_null);
+  if (N_s.bottomRows(n - pose_num_params).norm() > kMaxGaugeOtherParamsNorm) {
+    LOG(WARNING) << StringPrintf(
+        "Unable to compute covariance. The Schur complement on pose/other "
+        "parameters has a null space of dimension %d that involves the other "
+        "parameters and is thus not a gauge freedom.",
+        num_null);
+    return false;
+  }
+  VLOG(2) << "Gauge freedom of dimension " << num_null;
+
+  // Mapping N_s to unscaled pose coordinates amplifies its subspace error by
+  // the pose diagonal scale ratio, and unscaled projection I - N * N^T can
+  // leak the larger pose block into the smaller one by another factor of that
+  // ratio. Reject ill-conditioned projections (e.g., extreme scene scales or
+  // large world offsets) instead of returning corrupted covariances.
+  const Eigen::VectorXd pose_D_inv_sqrt = D_inv_sqrt.head(pose_num_params);
+  const double diag_ratio =
+      pose_D_inv_sqrt.maxCoeff() / pose_D_inv_sqrt.minCoeff();
+  const double null_residual =
+      std::max(std::numeric_limits<double>::epsilon(), (S_s * N_s).norm());
+  const double est_projection_error =
+      (null_residual / ritz.eigenvalues()(num_null)) * diag_ratio * diag_ratio;
+  if (est_projection_error > kMaxGaugeProjectionError) {
+    LOG(WARNING) << StringPrintf(
+        "Unable to compute covariance. Unscaled gauge projection is too "
+        "ill-conditioned (estimated relative error %.2e, pose diagonal ratio "
+        "%.2e, smallest non-null eigenvalue %.2e). Consider normalizing the "
+        "reconstruction scale and origin, or fixing the gauge.",
+        est_projection_error,
+        diag_ratio,
+        ritz.eigenvalues()(num_null));
+    return false;
+  }
+
+  // Project out N_s in scaled coordinates (two passes) before unscaling,
+  // eliminating the O(1 / sqrt(reg)) regularized null-space spike on both pose
+  // and other parameters.
+  L_inv = LInverseFromLDLT(ldlt_S_s_damped);
+  for (int i = 0; i < 2; ++i) {
+    const Eigen::MatrixXd L_N = L_inv * N_s;
+    L_inv.noalias() -= L_N * N_s.transpose();
+  }
+
+  // Null space of S on the pose block, orthonormal in unscaled tangent
+  // coordinates.
+  const Eigen::MatrixXd N_pose =
+      Eigen::JacobiSVD<Eigen::MatrixXd>(
+          pose_D_inv_sqrt.asDiagonal() * N_s.topRows(pose_num_params),
+          Eigen::ComputeThinU)
+          .matrixU();
+
+  // P * D^-1/2 * S_s^+ * D^-1/2 * P with P = I - N * N^T is the pseudo-inverse
+  // of S up to O(reg): D^-1/2 * S_s^+ * D^-1/2 is a generalized inverse of S.
+  L_inv *= D_inv_sqrt.asDiagonal();
+  const Eigen::MatrixXd L_pose_N = L_inv.leftCols(pose_num_params) * N_pose;
+  L_inv.leftCols(pose_num_params).noalias() -= L_pose_N * N_pose.transpose();
   return true;
 }
 
@@ -344,7 +599,8 @@ std::optional<BACovariance> EstimateBACovarianceFromProblem(
     return std::nullopt;
   }
 
-  if (!estimate_pose_covs && !estimate_other_covs) {
+  if ((!estimate_pose_covs && !estimate_other_covs) ||
+      (pose_num_params == 0 && other_num_params == 0)) {
     return BACovariance(std::move(point_covs),
                         /*pose_L_start_size=*/{},
                         /*other_L_start_size=*/{},
@@ -361,7 +617,7 @@ std::optional<BACovariance> EstimateBACovarianceFromProblem(
   VLOG(2) << "Computing L inverse";
 
   Eigen::MatrixXd L_inv;
-  if (!ComputeLInverse(S, L_inv)) {
+  if (!ComputeLInverse(S, pose_num_params, L_inv)) {
     return std::nullopt;
   }
 

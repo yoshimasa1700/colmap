@@ -126,8 +126,7 @@ void BindBundleAdjuster(py::module& m) {
            "gauge"_a,
            "Optionally fix the gauge of the bundle adjustment problem. By "
            "default, bundle adjustment leaves the gauge free and relies on "
-           "Levenberg-Marquardt damping, while callers such as "
-           "estimate_ba_covariance require a fixed gauge.")
+           "Levenberg-Marquardt damping.")
       .def_property_readonly("fixed_gauge", &BACfg::FixedGauge)
       .def("num_points", &BACfg::NumPoints)
       .def("num_constant_cam_intrinsics", &BACfg::NumConstantCamIntrinsics)
