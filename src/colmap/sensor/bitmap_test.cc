@@ -406,6 +406,44 @@ TEST(Bitmap, InterpolateBilinearGrey) {
   EXPECT_NEAR(color->r, 25.0f, 1e-5);
 }
 
+TEST(Bitmap, InterpolateBilinearGreyWithGradients) {
+  Bitmap bitmap(11, 10, /*as_rgb=*/false);
+  for (int y = 0; y < bitmap.Height(); ++y) {
+    for (int x = 0; x < bitmap.Width(); ++x) {
+      bitmap.SetPixel(x, y, BitmapColor<uint8_t>(2 * x + 3 * y + 10));
+    }
+  }
+  double val = 0.0;
+  double dx = 0.0;
+  double dy = 0.0;
+  ASSERT_TRUE(bitmap.InterpolateBilinear(4.35, 3.65, &val, &dx, &dy));
+  EXPECT_DOUBLE_EQ(val, 2.0 * 4.35 + 3.0 * 3.65 + 10.0);
+  EXPECT_DOUBLE_EQ(dx, 2.0);
+  EXPECT_DOUBLE_EQ(dy, 3.0);
+
+  // Finite-difference check on a non-linear pixel neighborhood.
+  bitmap.SetPixel(5, 4, BitmapColor<uint8_t>(200));
+  ASSERT_TRUE(bitmap.InterpolateBilinear(4.35, 3.65, &val, &dx, &dy));
+  const double eps = 1e-5;
+  double vp = 0.0;
+  double vm = 0.0;
+  ASSERT_TRUE(bitmap.InterpolateBilinear(4.35 + eps, 3.65, &vp));
+  ASSERT_TRUE(bitmap.InterpolateBilinear(4.35 - eps, 3.65, &vm));
+  EXPECT_NEAR(dx, (vp - vm) / (2.0 * eps), 1e-8);
+  ASSERT_TRUE(bitmap.InterpolateBilinear(4.35, 3.65 + eps, &vp));
+  ASSERT_TRUE(bitmap.InterpolateBilinear(4.35, 3.65 - eps, &vm));
+  EXPECT_NEAR(dy, (vp - vm) / (2.0 * eps), 1e-8);
+
+  // Out-of-bounds, NaN, and RGB bitmaps must return false.
+  EXPECT_FALSE(bitmap.InterpolateBilinear(-0.1, 3.0, &val));
+  EXPECT_FALSE(bitmap.InterpolateBilinear(10.0, 3.0, &val));
+  EXPECT_FALSE(bitmap.InterpolateBilinear(3.0, 9.0, &val));
+  EXPECT_FALSE(bitmap.InterpolateBilinear(
+      std::numeric_limits<double>::quiet_NaN(), 3.0, &val));
+  Bitmap rgb(11, 10, /*as_rgb=*/true);
+  EXPECT_FALSE(rgb.InterpolateBilinear(3.0, 3.0, &val, &dx, &dy));
+}
+
 TEST(Bitmap, InterpolateBilinearOutOfBounds) {
   Bitmap bitmap(11, 10, /*as_rgb=*/true);
   bitmap.Fill(BitmapColor<uint8_t>(1, 2, 3));
