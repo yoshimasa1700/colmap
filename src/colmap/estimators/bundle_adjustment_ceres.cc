@@ -18,7 +18,7 @@
 
 namespace colmap {
 
-namespace {
+namespace ceres_ba_internal {
 
 BundleAdjustmentTerminationType CeresTerminationTypeToTerminationType(
     ceres::TerminationType ceres_type) {
@@ -38,13 +38,14 @@ BundleAdjustmentTerminationType CeresTerminationTypeToTerminationType(
   return BundleAdjustmentTerminationType::FAILURE;
 }
 
-}  // namespace
+}  // namespace ceres_ba_internal
 
 std::shared_ptr<CeresBundleAdjustmentSummary>
 CeresBundleAdjustmentSummary::Create(ceres::Solver::Summary ceres_summary) {
   auto summary = std::make_shared<CeresBundleAdjustmentSummary>();
   summary->termination_type =
-      CeresTerminationTypeToTerminationType(ceres_summary.termination_type);
+      ceres_ba_internal::CeresTerminationTypeToTerminationType(
+          ceres_summary.termination_type);
   summary->num_residuals = ceres_summary.num_residuals_reduced;
   summary->ceres_summary = std::move(ceres_summary);
   return summary;
@@ -255,21 +256,18 @@ void FixGaugeWithThreePoints(
       << fixed_gauge.num_fixed_points;
 }
 
-// Note that the following implementation does not handle all degenerate edge
-// cases well, e.g., where the selected two cameras are not well constrained
-// with respect to each other with shared observations. Furthermore, the
-// implementation could be more sophisticated for multi-camera rigs by selecting
-// camera pairs within a rig, etc.
-void FixGaugeWithTwoCamsFromWorld(
-    const BundleAdjustmentOptions& options,
-    const BundleAdjustmentConfig& config,
-    const std::set<image_t>& image_ids,
-    const FlatHashMap<point3D_t, size_t>& point3D_num_observations,
-    Reconstruction& reconstruction,
-    ceres::Problem& problem) {
+}  // namespace
+
+namespace ceres_ba_internal {
+
+bool TryFixGaugeWithTwoCamsFromWorld(const BundleAdjustmentOptions& options,
+                                     const BundleAdjustmentConfig& config,
+                                     const std::set<image_t>& image_ids,
+                                     Reconstruction& reconstruction,
+                                     ceres::Problem& problem) {
   // No need to fix the Gauge if all frames are constant.
   if (!options.refine_rig_from_world) {
-    return;
+    return true;
   }
 
   Image* image1 = nullptr;
@@ -306,7 +304,7 @@ void FixGaugeWithTwoCamsFromWorld(
         image1 = &image;
       } else if (image1 != nullptr && image1->FrameId() != image.FrameId()) {
         // No need to fix the Gauge if two frames are already fixed.
-        return;
+        return true;
       }
     }
   }
@@ -316,7 +314,8 @@ void FixGaugeWithTwoCamsFromWorld(
   for (const image_t image_id : image_ids) {
     Image& image = reconstruction.Image(image_id);
     const Rigid3d& rig_from_world = image.FramePtr()->RigFromWorld();
-    if (image1 == nullptr && IsParameterizedConstSensor(image)) {
+    if (image1 == nullptr && IsParameterizedConstSensor(image) &&
+        problem.HasParameterBlock(rig_from_world.params.data())) {
       image1 = &image;
     } else if (image1 != nullptr && image1->FrameId() != image.FrameId() &&
                IsParameterizedConstSensor(image) &&
@@ -337,16 +336,8 @@ void FixGaugeWithTwoCamsFromWorld(
     }
   }
 
-  // TODO(jsch): Notice that we could alternatively fall back to fixing the
-  // Gauge between two cameras in the same frame or in different frames. Since
-  // there are many different combinations to iterate through, we instead fall
-  // back to fixing the Gauge with three points for simplicity. Furthermore,
-  // once we support IMUs or other sensors, we should fix the Gauge differently.
   if (image1 == nullptr || image2 == nullptr) {
-    LOG(WARNING) << "Failed to fix Gauge with two cameras. "
-                    "Falling back to fixing Gauge with three points.";
-    FixGaugeWithThreePoints(point3D_num_observations, reconstruction, problem);
-    return;
+    return false;
   }
 
   if (!config.HasConstantRigFromWorldPose(image1->FrameId())) {
@@ -369,6 +360,7 @@ void FixGaugeWithTwoCamsFromWorld(
                       CreateSubsetManifold(3, {frame2_from_world_fixed_dim})));
     }
   }
+  return true;
 }
 
 void ParameterizeCameras(const BundleAdjustmentOptions& options,
@@ -498,6 +490,39 @@ void ParameterizeRigsAndFrames(const BundleAdjustmentOptions& options,
   }
 }
 
+}  // namespace ceres_ba_internal
+
+namespace {
+
+using ceres_ba_internal::CancellationCallback;
+using ceres_ba_internal::ParameterizeCameras;
+using ceres_ba_internal::ParameterizeRigsAndFrames;
+
+// Note that the following implementation does not handle all degenerate edge
+// cases well, e.g., where the selected two cameras are not well constrained
+// with respect to each other with shared observations. Furthermore, the
+// implementation could be more sophisticated for multi-camera rigs by selecting
+// camera pairs within a rig, etc.
+void FixGaugeWithTwoCamsFromWorld(
+    const BundleAdjustmentOptions& options,
+    const BundleAdjustmentConfig& config,
+    const std::set<image_t>& image_ids,
+    const FlatHashMap<point3D_t, size_t>& point3D_num_observations,
+    Reconstruction& reconstruction,
+    ceres::Problem& problem) {
+  // TODO(jsch): Notice that we could alternatively fall back to fixing the
+  // Gauge between two cameras in the same frame or in different frames. Since
+  // there are many different combinations to iterate through, we instead fall
+  // back to fixing the Gauge with three points for simplicity. Furthermore,
+  // once we support IMUs or other sensors, we should fix the Gauge differently.
+  if (!ceres_ba_internal::TryFixGaugeWithTwoCamsFromWorld(
+          options, config, image_ids, reconstruction, problem)) {
+    LOG(WARNING) << "Failed to fix Gauge with two cameras. "
+                    "Falling back to fixing Gauge with three points.";
+    FixGaugeWithThreePoints(point3D_num_observations, reconstruction, problem);
+  }
+}
+
 void ParameterizePoints(
     const BundleAdjustmentOptions& options,
     const BundleAdjustmentConfig& config,
@@ -525,22 +550,6 @@ std::shared_ptr<CeresBundleAdjustmentSummary> CreateSummaryAndLogFailure(
   }
   return summary;
 }
-
-class CancellationCallback : public ceres::IterationCallback {
- public:
-  explicit CancellationCallback(std::function<bool()> check_if_stopped)
-      : check_if_stopped_(std::move(check_if_stopped)) {}
-
-  ceres::CallbackReturnType operator()(
-      const ceres::IterationSummary&) override {
-    return check_if_stopped_ && check_if_stopped_()
-               ? ceres::SOLVER_TERMINATE_SUCCESSFULLY
-               : ceres::SOLVER_CONTINUE;
-  }
-
- private:
-  std::function<bool()> check_if_stopped_;
-};
 
 ceres::Solver::Summary SolveWithGpuFallback(
     const BundleAdjustmentOptions& options,
